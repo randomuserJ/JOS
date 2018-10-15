@@ -86,7 +86,19 @@ boot_alloc(uint32_t n)
 {
 	static char *nextfree;	// virtual address of next byte of free memory
 	char *result;
-	size_t max_addr = npages*PGSIZE;	
+	
+	size_t MAX_KVADDR = KERNBASE+(4*1024*1024);// z prednasky
+					// KERNBASE = 0xF000 0000
+					// + 4MB    = 0xF040 0000
+						//  = 4 030 726 145 B
+ 	size_t MAX_PHADDR = 4*1024*1024;	//  = 0x0040 0000
+						//  = 4 194 304 B1
+					// od Patrika
+	size_t MAX_ADDR = npages*PGSIZE;	//  = 0x 0800 0000
+    				    // 32768 * 4096 = 134 217 728 B
+
+		// KTORE JE TEDA SPRAVNE ? 
+
 	char* newfree = NULL;
 	
 	// Initialize nextfree if this is the first time.
@@ -99,25 +111,51 @@ boot_alloc(uint32_t n)
 		extern char end[];
 		nextfree = ROUNDUP((char *) end, PGSIZE);
 	}
+	
+// Na konci jadra by sa mal nachadzat symbol end. Ten nam ukazuje
+// na prvu volnu pamat za jadrom. (Ukazka RAMky v memlayout.h)
+// ak ma jadro 4MB, mal by teda end byt nieco ako 0xf040'0000 ???
+
 
 	// Allocate a chunk large enough to hold 'n' bytes, then update
 	// nextfree.  Make sure nextfree is kept aligned
 	// to a multiple of PGSIZE.
 	
 	// LAB 2: Your code here.
-	if (n == 0)
+/*
+	physaddr_t physaddr = 983040; 	// 0xF0000
+	uintptr_t virtaddr = (uintptr_t)KADDR(physaddr);
+	cprintf("physical addr - 0x%08x : %u\n", physaddr, physaddr);
+	cprintf("virtual addr - 0x%x : %u\n", virtaddr, virtaddr);
+
+	virtaddr = 0xf00f7c00;
+	physaddr = PADDR((void*)virtaddr);
+	cprintf("physical addr - 0x%08x : %u\n", physaddr, physaddr);
+        cprintf("virtual addr - 0x%x : %u\n", virtaddr, virtaddr);
+*/	
+
+// pri boot_alloc(-n) sa nedeje nic ¯\_(ツ)_/¯
+// pri boot_alloc(0) ziskame adresu prvej volnej stranky 
+// pri boot_alloc(n) rezervujeme miesto tym, ze posunieme nasledujucu volnu 
+//  stranku nextfree o tolko, kolko je n a vratime adresu, kde zacina 
+// ak presiahneme povolenu pamat - zacneme panikarit ... ale kolko to je ?!
+// nextfree je static, preto ostane jej hodnota ulozena pri dalsom volani funkcie
+
+	if (n < 0) {
+		panic("boot_alloc: cannot allocate negative amount of memory");
+	} else if (n == 0) {
+		return nextfree;
+	} else {
 		result = nextfree;
 
-	if (n > 0){
 		newfree = ROUNDUP(nextfree+n, PGSIZE);
-		if(PADDR(newfree) <= max_addr){
-			result = nextfree;
-			nextfree = newfree;
-		}
+			
+		if (PADDR(newfree) > MAX_ADDR)
+			panic("boot_alloc: Out of memory");
 		else
-			panic("boot_alloc: Out of memory\n");
+			nextfree = newfree;
 	}
-
+		
 	return result;
 }
 
@@ -138,9 +176,15 @@ mem_init(void)
 
 	// Find out how much memory the machine has (npages & npages_basemem).
 	i386_detect_memory();
+	
+//	boot_alloc(0);
+//	boot_alloc(-10);		// nepanikari .. PRECO ??? 
+//	boot_alloc(npages*PGSIZE); 	// panic - alokovanie prilis velkej hodnoty
+	
 
 	// Remove this line when you're ready to test this function.
-	//panic("mem_init: This function is not finished\n");
+	
+//	panic("mem_init: This function is not finished\n");
 
 	//////////////////////////////////////////////////////////////////////
 	// create initial page directory.
@@ -157,14 +201,20 @@ mem_init(void)
 	kern_pgdir[PDX(UVPT)] = PADDR(kern_pgdir) | PTE_U | PTE_P;
 
 	//////////////////////////////////////////////////////////////////////
-	// Allocate an array of npages 'struct PageInfo's and store it in 'pages'.
+	// Allocate an array pages 'struct PageInfo's and store it in 'pages'.
 	// The kernel uses this array to keep track of physical pages: for
 	// each physical page, there is a corresponding struct PageInfo in this
 	// array.  'npages' is the number of physical pages in memory.  Use memset
 	// to initialize all fields of each struct PageInfo to 0.
 	// Your code goes here:
-	pages = (struct PageInfo*)boot_alloc(npages * sizeof(struct PageInfo));
-	memset(pages, 0, sizeof(struct PageInfo) * npages);
+
+// pages je pole pointerov na strukturu PageInfo
+// boot_alloc alokuje pamat pre vsetky npages velkosti PageInfo
+// boot_alloc vrati (void*) adresu prvej volnej stranky, ktora ukazuje na dalsiu ...
+// treba vobec pretypovavat ??
+// memsetujeme od pages po vsetky stranky (x ich velkost) => memsetujeme vsetko
+	pages = boot_alloc(npages*sizeof(struct PageInfo));
+	memset(pages, 0, npages * sizeof(struct PageInfo));
 
 	//////////////////////////////////////////////////////////////////////
 	// Now that we've allocated the initial kernel data structures, we set
@@ -274,62 +324,93 @@ page_init(void)
 	// NB: DO NOT actually touch the physical memory corresponding to
 	// free pages!
 	
-	for (size_t i = 0; i < npages; i++) {
-		if (i == 0) {
+// prva stranka sa nesmie pouzivat - markneme jej pp_ref ako 1
+
+// dalej stranky v rozsahu <1 ; npages_basemem> sa pouzivat mozu
+// size_t npages_basemem = basemem / (PGSIZE / 1024) 
+//	amount of base memory  -  4 027 932 672 (0xf015 6000)
+//	npages_basemem * PGSIZE  ??? 	HALO ? cisla ???
+
+// IO hole <0x0A 0000 ; 0x10 0000) sa nesmnie alokovat
+// smie sa alokovat az od prvej volnej stranky (preskocime celu RAMku ???)
+// krenel je mapovany od KERNBASE 0xF000 0000 a ma 4MB (0xF010 0000 ???)
+
+	size_t i;
+	pages[0].pp_ref = 1;
+
+	for (i = 1; i < npages; i++) {
+		if ( (i*PGSIZE >= IOPHYSMEM) && (i*PGSIZE < EXTPHYSMEM) ){
 			pages[i].pp_ref = 1;
-			pages[i].pp_link = NULL;
-			} else if (i < npages_basemem) {
-				pages[i].pp_ref = 0;
-				pages[i].pp_link = page_free_list;
-				page_free_list = &pages[i];
-			} else if ((page2pa(&pages[i]) >= IOPHYSMEM) && (page2pa(&pages[i]) < EXTPHYSMEM)) {
-				pages[i].pp_ref = 1;
-				pages[i].pp_link = NULL;
-/*			} else if ((page2pa(&pages[i]) >= EXTPHYSMEM) && (page2kva(&pages[i]) < boot_alloc(0))) {
-				pages[i].pp_ref = 1;
-				pages[i].pp_link = NULL;
-*/			} else {
-				pages[i].pp_ref = 0;
-				pages[i].pp_link = page_free_list;
-				page_free_list = &pages[i];
-			}
+			continue;
 		}
-	}
+		if ( (i*PGSIZE >= EXTPHYSMEM) && (i*PGSIZE < PADDR(boot_alloc(0))) ){
+			pages[i].pp_ref = 1;	
+			continue;
+		}
 
-	//
-	// Allocates a physical page.  If (alloc_flags & ALLOC_ZERO), fills the entire
-	// returned physical page with '\0' bytes.  Does NOT increment the reference
-	// count of the page - the caller must do these if necessary (either explicitly
-	// or via page_insert).
-	//
-	// Be sure to set the pp_link field of the allocated page to NULL so
-	// page_free can check for double-free bugs.
-	//
-	// Returns NULL if out of free memory.
-	//
-	// Hint: use page2kva and memset
-	struct PageInfo *
-	page_alloc(int alloc_flags)
-	{
-		struct PageInfo *result = NULL;
+		pages[i].pp_ref = 0;
+		pages[i].pp_link = page_free_list;
+		page_free_list = &pages[i];
+	} 
+}
 
-		if(page_free_list) {
-			result = page_free_list;
-			page_free_list = page_free_list->pp_link;
 
-			result->pp_link = NULL;
+//
+// Allocates a physical page.  If (alloc_flags & ALLOC_ZERO), fills the entire
+// returned physical page with '\0' bytes.  Does NOT increment the reference
+// count of the page - the caller must do these if necessary (either explicitly
+// or via page_insert).
+//
+// Be sure to set the pp_link field of the allocated page to NULL so
+// page_free can check for double-free bugs.
+//
+// Returns NULL if out of free memory.
+//
+// Hint: use page2kva and memset
 
-		if(alloc_flags & ALLOC_ZERO) 
-			memset(page2kva(result), '\0', PGSIZE);
-	}
 
-	return result;
+// ak nemame ziadne volne stranky (page_free_list je prazdny), vratime NULL
+// ak mame stranky, cize je vytvoreny zoznam struktur PageInfo, odoberieme
+// z neho prvu stranku
+// ak plati podmienka z komentu, naplnime celu fyzicku stranku nulami
+
+// jedna polozka zoznamu p_f_l = 1 stranka (polozka struktury PageInfo)
+// odobratie : 
+// head nastavime na zaciatok zoznamu
+// zaciatok bude ukazovat na dalsi prvok
+
+// head prvok ukazuje na stranku, ktoru sme alokovali. Preto odstarnime
+// smernik, ktorym ona ukazuje na dalsiu stranku a vratime jej adresu
+// v komente chcu, aby sme neikrementovali pp_ref alokovanej stranky, tak nebudeme
+
+struct PageInfo *
+page_alloc(int alloc_flags)
+{
+	if (!page_free_list)
+		return NULL;
+
+	struct PageInfo *head = NULL;
+
+	head = page_free_list;
+	page_free_list = page_free_list->pp_link;
+	head->pp_link = NULL;
+
+	if(alloc_flags & ALLOC_ZERO) 
+		memset(page2kva(head), '\0', PGSIZE);
+
+	return head;
 }
 
 //
 // Return a page to the free list.
 // (This function should only be called when pp->pp_ref reaches 0.)
 //
+// V podstate iba prilepime stranku zo vstupu (pp) naspat do 
+// listu volnych stranok
+// pridanie:
+// pp->pp_link bude ukazovat na zaciatok zoznamu (page_free_list)
+// zaciatok zoznamu nastavime na novu stranku pp
+
 void
 page_free(struct PageInfo *pp)
 {
@@ -337,10 +418,8 @@ page_free(struct PageInfo *pp)
 	// Hint: You may want to panic if pp->pp_ref is nonzero or
 	// pp->pp_link is not NULL.
 
-	if (pp->pp_ref > 0) 
-		panic("page_free: Page being freed is still referred to by pointers.\n");
-	if (pp->pp_link) 
-		panic("page_free: Page being freed still has links to the other pages.\n");
+	if ( (pp->pp_ref != 0) || (pp->pp_link != NULL) ) 
+		panic("page_free: attempt to free page, which is in use");
 
 	pp->pp_link = page_free_list;
 	page_free_list = pp;
